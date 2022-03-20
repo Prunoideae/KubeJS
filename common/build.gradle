@@ -1,3 +1,20 @@
+import com.google.gson.GsonBuilder
+import com.google.gson.JsonObject
+import net.fabricmc.mappingio.tree.MemoryMappingTree
+import org.objectweb.asm.ClassReader
+import org.objectweb.asm.ClassWriter
+import org.objectweb.asm.Opcodes
+import org.objectweb.asm.Type
+import org.objectweb.asm.tree.AnnotationNode
+import org.objectweb.asm.tree.ClassNode
+import org.objectweb.asm.tree.FieldNode
+
+import java.nio.file.FileSystemNotFoundException
+import java.nio.file.FileSystems
+import java.nio.file.Files
+import java.nio.file.Path
+import java.util.stream.Collectors
+
 dependencies {
 	modImplementation "net.fabricmc:fabric-loader:${rootProject.fabric_loader_version}"
 
@@ -24,6 +41,149 @@ loom {
 
 artifacts {
 	dev(jar)
+}
+
+task remapConstants(type: RemapAllConstantsTask) {
+	inputJar = jar.archiveFile
+	minecraftJar = project.layout.file(project.provider { loom.namedMinecraftProvider.parentMinecraftProvider.mergedJar.toFile() })
+}
+
+class RemapAllConstantsTask extends DefaultTask {
+	static def shadowDesc = "Lorg/spongepowered/asm/mixin/Shadow;"
+	static def finalDesc = "Lorg/spongepowered/asm/mixin/Final;"
+	static def remapDesc = "Ldev/latvian/mods/rhino/util/RemapForJS;"
+	static def autoMappedDesc = "Ldev/latvian/mods/kubejs/AutoMapped;"
+
+	@InputFile
+	final RegularFileProperty inputJar = project.objects.fileProperty()
+	@InputFile
+	final RegularFileProperty minecraftJar = project.objects.fileProperty()
+
+	@TaskAction
+	def process() {
+		def gson = new GsonBuilder().setPrettyPrinting().create()
+
+		System.out.println(inputJar.get().toString())
+
+		// 1. walk the input jar with nio zip filesystem
+		// 2. if the file is a class file in dev.latvian.mods.kubejs.mixin.marker, process it
+		// 3. write the processed file (if a marker) or copy the original file to the output jar
+		try (def fs = waitForFileSystem(inputJar.get().asFile.toURI())) {
+			def refmapPath = fs.getPath("kubejs-common-refmap.json")
+			def refmapJson = gson.fromJson(Files.newBufferedReader(refmapPath), JsonObject)
+			def refmapMappings = refmapJson.getAsJsonObject("mappings")
+			def refmapData = refmapJson.getAsJsonObject("data").getAsJsonObject("named:intermediary")
+
+			MemoryMappingTree mappings = project.loom.mappingsProvider.mappings
+
+			try (def mcFs = waitForFileSystem(minecraftJar.get().asFile.toURI())) {
+				Files.list(fs.getPath("dev/latvian/mods/kubejs/mixin/marker"))
+						.filter { Files.isRegularFile(it) && it.toString().endsWith(".class") }
+						.map(this.&loadClass)
+						.forEach { markerClass ->
+							def markerName = markerClass.name
+
+							if (!refmapMappings.has(markerName)) {
+								refmapMappings.add(markerName, new JsonObject())
+							}
+							if (!refmapData.has(markerName)) {
+								refmapData.add(markerName, new JsonObject())
+							}
+							// 1. find the name of the target class of the mixin through the @Mixin annotation
+							// 2. load the target class from the merged (named) minecraft jar
+							// 3. find all public static final fields in the target class, and for each of them:
+							//    - add a @Shadow @Final field with the same name to the mixin class
+							//    - add a @RemapForJS annotation containing the name of the field in the target class
+							//    - add an entry in the refmap for the shadowed field
+							if (markerClass.invisibleAnnotations.any { it.desc == autoMappedDesc }) {
+								logger.info("${markerClass.name} was previously automatically mapped, skipping...")
+								return
+							}
+
+							markerClass.invisibleAnnotations.forEach { aNode ->
+								if (aNode.desc == "Lorg/spongepowered/asm/mixin/Mixin;") {
+									def target = (aNode.values[aNode.values.indexOf("value") + 1] as List<Type>).get(0).internalName
+
+									// TODO: this obviously doesn't work on inner classes, stop being lazy max
+									def targetClass = loadClass(mcFs.getPath("${target}.class"))
+
+									targetClass.fields.stream()
+											.filter { (it.access ^ (Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC | Opcodes.ACC_FINAL)) == 0 }
+											.map { new FieldNode(it.access, it.name, it.desc, null, null) }
+											.forEach { field ->
+												// if the field is public, static AND final, process it
+												def remapAnnotation = new AnnotationNode(remapDesc)
+												remapAnnotation.values = ["value", field.name]
+
+												field.invisibleAnnotations = [
+														new AnnotationNode(shadowDesc),
+														new AnnotationNode(finalDesc),
+														remapAnnotation
+												]
+												markerClass.fields.add(field)
+
+												int named = mappings.getNamespaceId("named")
+												int intermediary = mappings.getNamespaceId("intermediary")
+
+												def namedField = mappings.getField(target, field.name, field.desc, named)
+												String entry = "${namedField.getDstName(intermediary)}:${namedField.getDstDesc(intermediary)}"
+
+												refmapMappings.getAsJsonObject(markerName).addProperty(field.name, entry)
+												refmapData.getAsJsonObject(markerName).addProperty(field.name, entry)
+											}
+								}
+							}
+
+							markerClass.invisibleAnnotations.add(new AnnotationNode(autoMappedDesc))
+
+							logger.debug(markerClass.fields.stream().map {
+								"${it.name}:${it.desc}"
+							}.collect(Collectors.joining("\n", "[", "]")))
+
+							// save the updated class
+							def writer = new ClassWriter(0)
+							markerClass.accept(writer)
+							Files.write(fs.getPath("${markerClass.name}.class"), writer.toByteArray())
+						}
+			}
+
+			// save the updated refmap
+			Files.writeString(refmapPath, gson.toJson(refmapJson))
+		}
+	}
+
+	static loadClass(Path path) {
+		def node = new ClassNode()
+		try (def is = Files.newInputStream(path)) {
+			new ClassReader(is).accept(node, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES)
+		}
+		return node
+	}
+
+	static waitForFileSystem(URI input) {
+		URI uri = URI.create("jar:${input}")
+		while (true) {
+			try {
+				FileSystems.getFileSystem(uri)
+				Thread.sleep(200)
+			} catch (FileSystemNotFoundException ignored) {
+				break
+			}
+		}
+		return FileSystems.newFileSystem(uri, [create: false])
+	}
+}
+
+jar {
+	finalizedBy remapConstants
+}
+
+transformProductionFabric {
+	mustRunAfter remapConstants
+}
+
+transformProductionForge {
+	mustRunAfter remapConstants
 }
 
 publishing {

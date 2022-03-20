@@ -1,4 +1,4 @@
-package dev.latvian.mods.kubejs.mixin.common;
+package dev.latvian.mods.kubejs.mixin.client;
 
 import dev.latvian.mods.kubejs.client.ClientProperties;
 import net.minecraft.client.gui.screens.Screen;

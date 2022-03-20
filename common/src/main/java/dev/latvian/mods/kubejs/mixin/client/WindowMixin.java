@@ -1,4 +1,4 @@
-package dev.latvian.mods.kubejs.mixin.common;
+package dev.latvian.mods.kubejs.mixin.client;
 
 import com.mojang.blaze3d.platform.Window;
 import dev.latvian.mods.kubejs.client.ClientProperties;

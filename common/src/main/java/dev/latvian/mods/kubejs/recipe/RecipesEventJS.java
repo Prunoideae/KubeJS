@@ -137,32 +137,32 @@ public class RecipesEventJS extends EventJS {
 	// hacky workaround for parallel streams, which are executed on the common fork/join pool by default
 	// and forge / event bus REALLY does not like that (plus it's generally just safer to use our own pool)
 	private static final ForkJoinPool PARALLEL_THREAD_POOL = new ForkJoinPool(Math.max(1, Runtime.getRuntime().availableProcessors() - 1),
-		forkJoinPool -> {
-			final ForkJoinWorkerThread thread = new ForkJoinWorkerThread(forkJoinPool) {
-			};
-			thread.setContextClassLoader(RecipesEventJS.class.getClassLoader()); // better safe than sorry
-			thread.setName(String.format("KubeJS Recipe Event Worker %d", thread.getPoolIndex()));
-			return thread;
-		},
-		(thread, ex) -> {
-			while ((ex instanceof CompletionException | ex instanceof InvocationTargetException | ex instanceof WrappedException) && ex.getCause() != null) {
-				ex = ex.getCause();
-			}
+			forkJoinPool -> {
+				final ForkJoinWorkerThread thread = new ForkJoinWorkerThread(forkJoinPool) {
+				};
+				thread.setContextClassLoader(RecipesEventJS.class.getClassLoader()); // better safe than sorry
+				thread.setName(String.format("KubeJS Recipe Event Worker %d", thread.getPoolIndex()));
+				return thread;
+			},
+			(thread, ex) -> {
+				while ((ex instanceof CompletionException | ex instanceof InvocationTargetException | ex instanceof WrappedException) && ex.getCause() != null) {
+					ex = ex.getCause();
+				}
 
-			if (ex instanceof ReportedException crashed) {
-				// crash the same way Minecraft would
-				Bootstrap.realStdoutPrintln(crashed.getReport().getFriendlyReport());
-				System.exit(-1);
-			}
+				if (ex instanceof ReportedException crashed) {
+					// crash the same way Minecraft would
+					Bootstrap.realStdoutPrintln(crashed.getReport().getFriendlyReport());
+					System.exit(-1);
+				}
 
-			ConsoleJS.SERVER.error("Error in thread %s while performing bulk recipe operation!".formatted(thread), ex);
+				ConsoleJS.SERVER.error("Error in thread %s while performing bulk recipe operation!".formatted(thread), ex);
 
-			RecipeExceptionJS rex = ex instanceof RecipeExceptionJS rex1 ? rex1 : new RecipeExceptionJS(null, ex).error();
+				RecipeExceptionJS rex = ex instanceof RecipeExceptionJS rex1 ? rex1 : new RecipeExceptionJS(null, ex).error();
 
-			if (rex.error) {
-				throw rex;
-			}
-		}, true);
+				if (rex.error) {
+					throw rex;
+				}
+			}, true);
 
 	@HideFromJS
 	public static Map<UUID, IngredientWithCustomPredicate> customIngredientMap = null;
@@ -375,19 +375,19 @@ public class RecipesEventJS extends EventJS {
 
 		try {
 			recipesByName.putAll(runInParallel(() -> originalRecipes.values().parallelStream()
-				.filter(RECIPE_NOT_REMOVED)
-				.map(this::createRecipe)
-				.filter(RECIPE_NON_NULL)
-				.collect(Collectors.toConcurrentMap(RECIPE_ID, RECIPE_IDENTITY, MERGE_ORIGINAL))));
+					.filter(RECIPE_NOT_REMOVED)
+					.map(this::createRecipe)
+					.filter(RECIPE_NON_NULL)
+					.collect(Collectors.toConcurrentMap(RECIPE_ID, RECIPE_IDENTITY, MERGE_ORIGINAL))));
 		} catch (Throwable ex) {
 			ConsoleJS.SERVER.error("Error creating datapack recipes", ex, SKIP_ERROR);
 		}
 
 		try {
 			recipesByName.putAll(runInParallel(() -> addedRecipes.parallelStream()
-				.map(this::createRecipe)
-				.filter(RECIPE_NON_NULL)
-				.collect(Collectors.toConcurrentMap(RECIPE_ID, RECIPE_IDENTITY, MERGE_ADDED))));
+					.map(this::createRecipe)
+					.filter(RECIPE_NON_NULL)
+					.collect(Collectors.toConcurrentMap(RECIPE_ID, RECIPE_IDENTITY, MERGE_ADDED))));
 		} catch (Throwable ex) {
 			ConsoleJS.SERVER.error("Error creating script recipes", ex, SKIP_ERROR);
 		}
@@ -489,10 +489,10 @@ public class RecipesEventJS extends EventJS {
 		return filter::test;
 	}
 
-	private record RecipeStreamFilter(RecipeFilter filter) implements Predicate<RecipeJS> {
+	private record RecipeStreamFilter(RecipeFilter filter, boolean includeRemoved) implements Predicate<RecipeJS> {
 		@Override
 		public boolean test(RecipeJS r) {
-			return r != null && !r.removed && filter.test(r);
+			return r != null && (includeRemoved || !r.removed) && filter.test(r);
 		}
 	}
 
@@ -503,7 +503,7 @@ public class RecipesEventJS extends EventJS {
 	 * that due to a bug in Forge (which will be resolved in Minecraft 1.20), you
 	 * will *have* to execute the Stream on a separate fork/join pool then!
 	 */
-	public Stream<RecipeJS> recipeStream(RecipeFilter filter) {
+	public Stream<RecipeJS> recipeStream(RecipeFilter filter, boolean includeRemoved) {
 		if (filter == ConstantFilter.FALSE) {
 			return Stream.empty();
 		} else if (filter instanceof IDFilter id) {
@@ -526,7 +526,7 @@ public class RecipesEventJS extends EventJS {
 			return or.list.stream().map(idf -> originalRecipes.get(((IDFilter) idf).id)).filter(RECIPE_NOT_REMOVED);
 		}
 
-		return originalRecipes.values().stream().filter(new RecipeStreamFilter(filter));
+		return originalRecipes.values().stream().filter(new RecipeStreamFilter(filter, includeRemoved));
 	}
 
 	/**
@@ -534,11 +534,11 @@ public class RecipesEventJS extends EventJS {
 	 * Note that this should <b>only</b> be used with a terminal operation that is
 	 * executed on our own fork/join pool!
 	 * <p>
-	 * See {@link #recipeStream(RecipeFilter)} for more information on why this needs to exist.
+	 * See {@link #recipeStream(RecipeFilter, boolean)} for more information on why this needs to exist.
 	 */
 	@ApiStatus.Internal
 	private Stream<RecipeJS> recipeStreamAsync(RecipeFilter filter) {
-		var stream = recipeStream(filter);
+		var stream = recipeStream(filter, false);
 		return CommonProperties.get().allowAsyncStreams ? stream.parallel() : stream;
 	}
 
@@ -551,7 +551,11 @@ public class RecipesEventJS extends EventJS {
 	}
 
 	public void forEachRecipe(RecipeFilter filter, Consumer<RecipeJS> consumer) {
-		recipeStream(filter).forEach(consumer);
+		forEachRecipe(filter, false, consumer);
+	}
+
+	public void forEachRecipe(RecipeFilter filter, boolean includeRemoved, Consumer<RecipeJS> consumer) {
+		recipeStream(filter, includeRemoved).forEach(consumer);
 	}
 
 	public int countRecipes(RecipeFilter filter) {
